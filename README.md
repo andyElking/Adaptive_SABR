@@ -1,5 +1,5 @@
 <h1 align='center'>Adaptive SDE solvers for the SABR model</h1>
-<h2 align='center'>by Andraž Jelinčič and James Foster</h2>
+<h2 align='center'>by James Foster and Andraž Jelinčič</h2>
 
 This repository contains numerical examples for the paper "On the Convergence of Adaptive Approximations for Stochastic Differential Equations" which can be found at TBA.
 
@@ -11,7 +11,7 @@ The code for the SABR model example is in `notebooks/SABR.ipynb`.
 To use this code, clone the repository and install the requirements:
 
 ```bash
-git clone https://github.com/your-username-here/Single-seed_BrownianMotion.git
-cd Single-seed_BrownianMotion/
+git clone https://github.com/andyElking/Adaptive_SABR.git
+cd Adaptive_SABR/
 pip install -e .
 ```
