@@ -16,6 +16,7 @@ from diffrax import (
     ODETerm,
     VirtualBrownianTree,
 )
+from diffrax._misc import is_tuple_of_ints
 from jax import Array
 from jaxtyping import PRNGKeyArray, PyTree, Shaped
 
@@ -99,7 +100,8 @@ def path_l2_dist(
     # all but the first two axes (which represent the number of samples
     # and the length of saveat). Also sum all the PyTree leaves.
     def sum_square_diff(y1, y2):
-        square_diff = jnp.square(y1 - y2)
+        with jax.numpy_dtype_promotion("standard"):
+            square_diff = jnp.square(y1 - y2)
         # sum all but the first two axes
         axes = range(2, square_diff.ndim)
         out = jnp.sum(square_diff, axis=axes)
@@ -115,7 +117,7 @@ def path_l2_dist(
 def _get_minimal_la(solver):
     while isinstance(solver, diffrax.HalfSolver):
         solver = solver.solver
-    return getattr(solver, "minimal_levy_area", diffrax.BrownianIncrement)
+    return getattr(solver, "minimal_levy_area", diffrax.AbstractBrownianIncrement)
 
 
 def _abstract_la_to_la(abstract_la):
@@ -129,30 +131,10 @@ def _abstract_la_to_la(abstract_la):
         raise ValueError(f"Unknown levy area {abstract_la}")
 
 
-@eqx.filter_jit
-@eqx.filter_vmap(
-    in_axes=(
-        0,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-)
-def _batch_sde_solve(
+def _sde_solve(
     key: PRNGKeyArray,
     get_terms: Callable[[diffrax.AbstractBrownianPath], diffrax.AbstractTerm],
-    w_shape: tuple[int, ...],
+    w_shape: Union[tuple[int, ...], PyTree[jax.ShapeDtypeStruct]],
     t0: float,
     t1: float,
     y0: PyTree[Array],
@@ -163,26 +145,30 @@ def _batch_sde_solve(
     controller: Optional[diffrax.AbstractStepSizeController],
     bm_tol: float,
     saveat: diffrax.SaveAt,
-    _w_t1: Optional[PyTree[Array]] = None,
-    _hh_t1: Optional[PyTree[Array]] = None,
+    use_progress_meter: bool,
 ):
     abstract_levy_area = _get_minimal_la(solver) if levy_area is None else levy_area
     concrete_la = _abstract_la_to_la(abstract_levy_area)
     dtype = jnp.result_type(*jtu.tree_leaves(y0))
-    struct = jax.ShapeDtypeStruct(w_shape, dtype)
+    if is_tuple_of_ints(w_shape):
+        struct = jax.ShapeDtypeStruct(w_shape, dtype)
+    else:
+        struct = w_shape
     bm = diffrax.VirtualBrownianTree(
         t0=t0,
         t1=t1,
         shape=struct,
         tol=bm_tol,
         key=key,
-        levy_area=concrete_la,  # pyright: ignore
-        _w_t1=_w_t1,
-        _hh_t1=_hh_t1,
+        levy_area=concrete_la,
     )
     terms = get_terms(bm)
     if controller is None:
         controller = diffrax.ConstantStepSize()
+
+    meter = (
+        diffrax.TqdmProgressMeter() if use_progress_meter else diffrax.NoProgressMeter()
+    )
     sol = diffrax.diffeqsolve(
         terms,
         solver,
@@ -191,29 +177,72 @@ def _batch_sde_solve(
         dt0=dt0,
         y0=y0,
         args=args,
-        max_steps=2**19,
+        max_steps=2**18,
         stepsize_controller=controller,
         saveat=saveat,
+        progress_meter=meter,
     )
     steps = sol.stats["num_accepted_steps"]
     if isinstance(solver, diffrax.HalfSolver):
-        if isinstance(solver.solver, diffrax.SPaRK):
-            steps *= 8 / 3
-        else:
-            steps *= 3
+        steps *= 3
     return sol.ys, steps
+
+
+_batch_sde_solve = eqx.filter_jit(
+    eqx.filter_vmap(
+        _sde_solve,
+        in_axes=(
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+)
+
+_batch_sde_solve_multi_y0 = eqx.filter_jit(
+    eqx.filter_vmap(
+        _sde_solve,
+        in_axes=(
+            0,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+)
 
 
 def _resulting_levy_area(
     levy_area1: type[diffrax.AbstractBrownianIncrement],
     levy_area2: type[diffrax.AbstractBrownianIncrement],
 ) -> type[diffrax.AbstractBrownianIncrement]:
-    """A helper that returns the stricter Levy area.
+    """A helper that returns the stricter Lévy area.
 
     **Arguments:**
 
-    - `levy_area1`: The first Levy area type.
-    - `levy_area2`: The second Levy area type.
+    - `levy_area1`: The first Lévy area type.
+    - `levy_area2`: The second Lévy area type.
 
     **Returns:**
 
@@ -245,7 +274,7 @@ def sde_solver_strong_order(
     y0: PyTree[Array],
     args: PyTree,
     solver: diffrax.AbstractSolver,
-    ref_solver: diffrax.AbstractSolver,
+    ref_solver: Optional[diffrax.AbstractSolver],
     levels: tuple[int, int],
     ref_level: int,
     get_dt_and_controller: Callable[
@@ -253,30 +282,38 @@ def sde_solver_strong_order(
     ],
     saveat: diffrax.SaveAt,
     bm_tol: float,
+    levy_area: Optional[type[diffrax.AbstractBrownianIncrement]],
+    ref_solution: Optional[PyTree[Array]],
 ):
-    levy_area1 = _get_minimal_la(solver)
-    levy_area2 = _get_minimal_la(ref_solver)
-    # Stricter levy_area requirements inherit from less strict ones
-    levy_area = _resulting_levy_area(levy_area1, levy_area2)
+    if levy_area is None:
+        levy_area1 = _get_minimal_la(solver)
+        levy_area2 = _get_minimal_la(ref_solver)
+        # Stricter levy_area requirements inherit from less strict ones
+        levy_area = _resulting_levy_area(levy_area1, levy_area2)
 
     level_coarse, level_fine = levels
 
-    dt, step_controller = get_dt_and_controller(ref_level)
-    correct_sols, _ = _batch_sde_solve(
-        keys,
-        get_terms,
-        w_shape,
-        t0,
-        t1,
-        y0,
-        args,
-        ref_solver,
-        levy_area,
-        dt,
-        step_controller,
-        bm_tol,
-        saveat,
-    )
+    if ref_solution is None:
+        assert ref_solver is not None
+        dt, step_controller = get_dt_and_controller(ref_level)
+        correct_sols, _ = _batch_sde_solve(
+            keys,
+            get_terms,
+            w_shape,
+            t0,
+            t1,
+            y0,
+            args,
+            ref_solver,
+            levy_area,
+            dt,
+            step_controller,
+            bm_tol,
+            saveat,
+            use_progress_meter=False,
+        )
+    else:
+        correct_sols = ref_solution
 
     errs_list, steps_list = [], []
     for level in range(level_coarse, level_fine + 1):
@@ -295,24 +332,33 @@ def sde_solver_strong_order(
             step_controller,
             bm_tol,
             saveat,
+            use_progress_meter=False,
         )
         errs = path_l2_dist(sols, correct_sols)
         errs_list.append(errs)
-        steps_list.append(jnp.mean(steps))
+        steps_list.append(jnp.average(steps))
     errs_arr = jnp.array(errs_list)
     steps_arr = jnp.array(steps_list)
-    order, _ = jnp.polyfit(jnp.log(1 / steps_arr), jnp.log(errs_arr), 1)
+    with jax.numpy_dtype_promotion("standard"):
+        order, _ = jnp.polyfit(jnp.log(1 / steps_arr), jnp.log(errs_arr), 1)
     return steps_arr, errs_arr, order
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(unsafe_hash=True)
 class SDE:
     get_terms: Callable[[AbstractBrownianPath], AbstractTerm]
     args: PyTree
     y0: PyTree[Array]
     t0: float
     t1: float
-    w_shape: tuple[int, ...]
+    _w_shape: Union[tuple[int, ...], PyTree[jax.ShapeDtypeStruct]]
+
+    @property
+    def w_shape(self):
+        if is_tuple_of_ints(self._w_shape):
+            return self._w_shape
+        else:
+            return self._w_shape
 
     def get_dtype(self):
         return jnp.result_type(*jtu.tree_leaves(self.y0))
@@ -323,8 +369,9 @@ class SDE:
         levy_area: type[Union[diffrax.BrownianIncrement, diffrax.SpaceTimeLevyArea]],
         tol: float,
     ):
-        shp_dtype = jax.ShapeDtypeStruct(self.w_shape, dtype=self.get_dtype())
-        return VirtualBrownianTree(self.t0, self.t1, tol, shp_dtype, bm_key, levy_area)
+        return VirtualBrownianTree(
+            self.t0, self.t1, tol, self.w_shape, bm_key, levy_area
+        )
 
 
 # A more concise function for use in the examples
@@ -337,6 +384,8 @@ def simple_sde_order(
     get_dt_and_controller,
     saveat,
     bm_tol,
+    levy_area,
+    ref_solution,
 ):
     _, level_fine = levels
     ref_level = level_fine + 2
@@ -355,6 +404,8 @@ def simple_sde_order(
         get_dt_and_controller,
         saveat,
         bm_tol,
+        levy_area,
+        ref_solution,
     )
 
 
@@ -367,8 +418,7 @@ def simple_batch_sde_solve(
     controller,
     bm_tol,
     saveat,
-    _w_t1: Optional[PyTree[Array]] = None,
-    _hh_t1: Optional[PyTree[Array]] = None,
+    use_progress_meter: bool = True,
 ):
     return _batch_sde_solve(
         keys,
@@ -384,8 +434,7 @@ def simple_batch_sde_solve(
         controller,
         bm_tol,
         saveat,
-        _w_t1=_w_t1,
-        _hh_t1=_hh_t1,
+        use_progress_meter,
     )
 
 
@@ -395,12 +444,14 @@ def _squareplus(x):
 
 def drift(t, y, args):
     mlp, _, _ = args
-    return 0.25 * mlp(y)
+    with jax.numpy_dtype_promotion("standard"):
+        return 0.25 * mlp(y)
 
 
 def diffusion(t, y, args):
     _, mlp, noise_dim = args
-    return 1.0 * mlp(y).reshape(3, noise_dim)
+    with jax.numpy_dtype_promotion("standard"):
+        return 1.0 * mlp(y).reshape(3, noise_dim)
 
 
 def get_mlp_sde(t0, t1, dtype, key, noise_dim):
@@ -482,8 +533,9 @@ def get_time_sde(t0, t1, dtype, key, noise_dim):
     drift_mlp = init_linear_weight(drift_mlp, lap_init, driftkey)
 
     def _drift(t, y, _):
-        mlp_out = drift_mlp(jnp.concatenate([y, ft(t)]))
-        return (0.01 * mlp_out - 0.5 * y**3) / (jnp.sum(y**2) + 1)
+        with jax.numpy_dtype_promotion("standard"):
+            mlp_out = drift_mlp(jnp.concatenate([y, ft(t)]))
+            return (0.01 * mlp_out - 0.5 * y**3) / (jnp.sum(y**2) + 1)
 
     diffusion_mx = jr.normal(diffusionkey, (4, y_dim, noise_dim), dtype=dtype)
 

@@ -13,5 +13,8 @@ To use this code, clone the repository and install the requirements:
 ```bash
 git clone https://github.com/andyElking/Adaptive_SABR.git
 cd Adaptive_SABR/
+python -m venv venv
+source venv/bin/activate
 pip install -e .
 ```
+If you aren't using a virtual environment, you can omit the third and fourth lines.
