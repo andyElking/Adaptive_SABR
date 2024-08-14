@@ -66,7 +66,7 @@ def draw_order_multiple_dict(
     ax.set_ylabel("RMS error")
     ax.set_xlabel("Average number of vector field evaluations")
     ymin, ymax = ax.get_ylim()
-    ax.set_ylim([ymin / 1.3, ymax])
+    ax.set_ylim([ymin / 1.3, ymax * 1.5])
     xmin, xmax = ax.get_xlim()
     ax.set_xlim([xmin / 1.6, xmax])
     top_legend = ax.legend(
@@ -206,7 +206,7 @@ def adjust_saveat_len(ref_sol, target_len):
 
 
 def constant_step_strong_order(
-    keys, sde, solver, levels, bm_tol=None, levy_area=None, ref_sol=None
+    keys, sde, solver, levels, bm_tol=None, levy_area=None, ref_sol=None, save_ts=None
 ):
     def _step_ts(level):
         return jnp.linspace(sde.t0, sde.t1, 2**level + 1, endpoint=True)
@@ -214,12 +214,14 @@ def constant_step_strong_order(
     def get_dt_controller(level):
         return None, diffrax.StepTo(ts=_step_ts(level))
 
-    _saveat = diffrax.SaveAt(ts=_step_ts(levels[0]))
+    if save_ts is None:
+        save_ts=_step_ts(levels[0])
+    saveat = diffrax.SaveAt(ts=save_ts)
     # make sure the saveat of the ref solution conincides
     if ref_sol is not None:
-        ref_sol = adjust_saveat_len(ref_sol, 2 ** levels[0] + 1)
+        ref_sol = adjust_saveat_len(ref_sol, len(save_ts))
         new_shape = jnp.shape(jtu.tree_leaves(ref_sol)[0])
-        assert new_shape[:2] == (len(keys), 2 ** levels[0] + 1)
+        assert new_shape[:2] == (len(keys), len(save_ts))
 
     if bm_tol is None:
         bm_tol = (sde.t1 - sde.t0) * (2 ** -(levels[1] + 3))
@@ -230,7 +232,7 @@ def constant_step_strong_order(
         solver,
         levels,
         get_dt_controller,
-        _saveat,
+        saveat,
         bm_tol,
         levy_area=levy_area,
         ref_solution=ref_sol,

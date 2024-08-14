@@ -5,6 +5,7 @@ import equinox as eqx
 import equinox.internal as eqxi
 import jax
 import jax.numpy as jnp
+from jax import lax
 from jaxtyping import Array, PyTree, Real
 
 from .._custom_types import (
@@ -52,8 +53,9 @@ class _JumpStepState(eqx.Module, Generic[_ControllerState]):
 
 
 def _get_t(i: IntScalarLike, ts: Array) -> RealScalarLike:
-    eqx.error_if(i, i < 0, "i must be >= 0. Consider increasing rejected_step_buffer_len.")
-    eqx.error_if(i, i > len(ts), "i must be < len(ts)")
+    i = eqx.error_if(i, i < 0, "i must be >= 0. "
+                               "Consider increasing rejected_step_buffer_len.")
+    i = eqx.error_if(i, i > len(ts), "i must be < len(ts)")
     i_min_len = jnp.minimum(i, len(ts) - 1)
     return jnp.where(i == len(ts), jnp.inf, ts[i_min_len])
 
@@ -264,11 +266,11 @@ class JumpStepWrapper(
             jump_ts = None
 
         if self.rejected_step_buffer_len > 0:
-            rjct_buff = jnp.zeros((self.rejected_step_buffer_len,), dtype=tdtype)
+            rjct_buff = jnp.zeros((self.rejected_step_buffer_len,) + jnp.shape(t1), dtype=tdtype)
         else:
             rjct_buff = None
         # rjct_buff[len(rjct_buff)] = jnp.inf (see def of _get_t)
-        i_rjct = self.rejected_step_buffer_len
+        i_rjct = jnp.asarray(self.rejected_step_buffer_len)
 
         # Find index of first element of step_ts/jump_ts greater than t0
         i_step = _find_index(t0, step_ts)
@@ -322,7 +324,7 @@ class JumpStepWrapper(
         ) = controller_state.get()
         # prev_dt is the previous dt_proposal, which cannot be smaller than the
         # actual step size `t1 - t0`.
-        eqx.error_if(prev_dt, prev_dt < t1 - t0, "prev_dt must be >= t1-t0")
+        prev_dt = eqx.error_if(prev_dt, prev_dt < t1 - t0 - 1e-6, "prev_dt must be >= t1-t0")
 
         # Let the controller do its thing
         (
@@ -374,7 +376,7 @@ class JumpStepWrapper(
             # stepped to this time and we increment i_rjct.
             # We increment i_rjct even if the step was rejected, because we will
             # re-add the rejected time to the buffer immediately.
-            rjct_inc_cond = t1 == _get_t(i_rjct, rjct_buff)
+            rjct_inc_cond = (t1 == _get_t(i_rjct, rjct_buff))
             i_rjct = jnp.where(rjct_inc_cond, i_rjct + 1, i_rjct)
             i_rjct = eqx.error_if(
                 i_rjct,
@@ -385,6 +387,12 @@ class JumpStepWrapper(
             # If the step was rejected, then we need to store the rejected time in the
             # rejected buffer and decrement the rejected index.
             i_rjct = jnp.where(keep_step, i_rjct, i_rjct - 1)
+            i_rjct = eqx.error_if(
+                i_rjct,
+                i_rjct < 0,
+                "Maximum number of rejected steps reached. "
+                "Consider increasing rejected_step_buffer_len."
+            )
             rjct_buff = jnp.where(keep_step, rjct_buff, rjct_buff.at[i_rjct].set(t1))
 
         # Now move on to the NEXT STEP
