@@ -388,7 +388,7 @@ def simple_sde_order(
     ref_solution,
 ):
     _, level_fine = levels
-    ref_level = level_fine + 2
+    ref_level = level_fine + 3
     return sde_solver_strong_order(
         keys,
         sde.get_terms,
